@@ -1,4 +1,4 @@
-ROM docker.m.daocloud.io/library/python:3.12-alpine
+FROM docker.m.daocloud.io/library/python:3.12-alpine
 ENV TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \
     YSP_DATA_DIR=/app/data

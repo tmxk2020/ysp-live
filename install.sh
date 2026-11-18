@@ -1,128 +1,228 @@
 #!/bin/sh
+# ysp-live 9.8-TMXK installer / updater
+# Back up persistent data before replacing the container and verify /health.
 
 CONTAINER_NAME="ysp-live"
-INSTALL_DIR="/root/ysp-live"
+INSTALL_BASE="${YSP_INSTALL_BASE:-/root/ysp-live}"
+PROJECT_DIR="$INSTALL_BASE/ysp-live-main"
 PORT="8767"
+YSP_BRANCH="${YSP_BRANCH:-main}"
+REPO_ZIP="https://codeload.github.com/tmxk2020/ysp-live/zip/refs/heads/$YSP_BRANCH"
 
-# 智能获取软路由局域网 IP
+RED='\033[1;31m'; GREEN='\033[1;32m'; YELLOW='\033[1;33m'; RESET='\033[0m'
+say_error() { printf "${RED}[错误] %s${RESET}\n" "$1"; }
+say_ok() { printf "${GREEN}%s${RESET}\n" "$1"; }
+say_warn() { printf "${YELLOW}%s${RESET}\n" "$1"; }
+
 get_local_ip() {
-    ip=$(uci get network.lan.ipaddr 2>/dev/null)
-    if [ -z "$ip" ]; then
-        ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-    fi
-    if [ -z "$ip" ]; then
-        ip="localhost"
-    fi
-    echo "$ip"
+    local_ip=$(uci get network.lan.ipaddr 2>/dev/null)
+    [ -n "$local_ip" ] || local_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [ -n "$local_ip" ] || local_ip="localhost"
+    printf '%s' "$local_ip"
 }
-
-IP=$(get_local_ip)
-
-# 统一展示服务访问链接 (使用 printf 保证 OpenWrt sh 终端完美高亮)
 show_links() {
+    IP=$(get_local_ip)
     echo ""
     echo "===================================================================="
-    echo "  📌 ysp-live 服务访问与管理链接："
-    printf "   • 全频道订阅地址: \033[1;32mhttp://%s:%s/all.m3u\033[0m\n" "$IP" "$PORT"
-    printf "   • 系统健康度检查: \033[1;32mhttp://%s:%s/health\033[0m\n" "$IP" "$PORT"
-    printf "   • 实时诊断与日志: \033[1;32mhttp://%s:%s/diag\033[0m\n" "$IP" "$PORT"
+    echo "  ysp-live 服务访问与管理链接"
+    printf "  全频道订阅: http://%s:%s/all.m3u\n" "$IP" "$PORT"
+    printf "  健康检查:   http://%s:%s/health\n" "$IP" "$PORT"
+    printf "  运行诊断:   http://%s:%s/diag\n" "$IP" "$PORT"
     echo "===================================================================="
     echo ""
 }
+select_compose() {
+    if docker compose version >/dev/null 2>&1; then
+        COMPOSE_MODE="plugin"
+    elif command -v docker-compose >/dev/null 2>&1; then
+        COMPOSE_MODE="standalone"
+    else
+        say_error "未检测到 Docker Compose，请安装 compose 插件或 docker-compose。"
+        return 1
+    fi
+}
+compose() {
+    if [ "$COMPOSE_MODE" = "plugin" ]; then docker compose "$@"; else docker-compose "$@"; fi
+}
+check_environment() {
+    command -v docker >/dev/null 2>&1 || { say_error "未检测到 Docker。"; return 1; }
+    command -v wget >/dev/null 2>&1 || { say_error "缺少 wget。"; return 1; }
+    command -v unzip >/dev/null 2>&1 || { say_error "缺少 unzip。"; return 1; }
+    docker info >/dev/null 2>&1 || { say_error "Docker 服务不可用，请先启动 Docker。"; return 1; }
+    select_compose || return 1
+}
+backup_existing_data() {
+    [ -n "$CONTAINER_ID" ] || return 0
+    mount_info=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Type}}|{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+    [ -n "$mount_info" ] || { say_warn "旧容器未发现 /app/data 挂载，将保留项目目录中的 data。"; return 0; }
 
-# 执行安装与更新核心函数
+    DATA_TYPE=${mount_info%%|*}
+    DATA_SOURCE=${mount_info#*|}
+    [ -d "$DATA_SOURCE" ] || { say_error "数据挂载路径不可读：$DATA_SOURCE"; return 1; }
+
+    BACKUP_DIR="$INSTALL_BASE/backups/data-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$BACKUP_DIR" || return 1
+    cp -a "$DATA_SOURCE" "$BACKUP_DIR/data" || {
+        say_error "旧数据备份失败，已中止更新；旧容器未删除。"
+        return 1
+    }
+    say_ok "旧数据备份完成：$BACKUP_DIR/data"
+
+    mkdir -p "$PROJECT_DIR/data" || return 1
+    if [ "$DATA_TYPE" = "bind" ]; then
+        case "$DATA_SOURCE" in *'"'*|*'\n'*) say_error "数据目录路径含不支持的字符：$DATA_SOURCE"; return 1 ;; esac
+        if [ -f "$PROJECT_DIR/.env" ]; then
+            grep -v '^YSP_HOST_DATA_DIR=' "$PROJECT_DIR/.env" > "$PROJECT_DIR/.env.tmp" 2>/dev/null || :
+            mv "$PROJECT_DIR/.env.tmp" "$PROJECT_DIR/.env"
+        fi
+        printf 'YSP_HOST_DATA_DIR="%s"\n' "$DATA_SOURCE" >> "$PROJECT_DIR/.env"
+    else
+        # Named-volume data is copied to the persistent bind directory; original volume is untouched.
+        cp -a "$DATA_SOURCE"/. "$PROJECT_DIR/data"/ || {
+            say_error "旧数据卷迁移失败；原数据卷保留，更新已中止。"
+            return 1
+        }
+    fi
+}
+download_and_stage() {
+    TMP_DIR="$INSTALL_BASE/.ysp-live-update.$$"
+    ZIP_FILE="$TMP_DIR/source.zip"
+    mkdir -p "$TMP_DIR" || return 1
+    trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
+    echo "[2/5] 下载 GitHub 源码（分支：$YSP_BRANCH）..."
+    wget -q --no-check-certificate "$REPO_ZIP" -O "$ZIP_FILE" || {
+        say_error "源码下载失败，请检查网络或 GitHub 访问。"
+        return 1
+    }
+    unzip -q "$ZIP_FILE" -d "$TMP_DIR" || { say_error "源码解压失败。"; return 1; }
+    SRC_DIR=$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+    [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/Dockerfile" ] && [ -f "$SRC_DIR/docker-compose.yml" ] || {
+        say_error "源码缺少 Dockerfile 或 docker-compose.yml，已中止。"
+        return 1
+    }
+    # Never overwrite runtime data with anything from the source archive.
+    rm -rf "$SRC_DIR/data"
+    mkdir -p "$PROJECT_DIR" || return 1
+    cp -R "$SRC_DIR"/. "$PROJECT_DIR"/ || { say_error "复制项目文件失败。"; return 1; }
+    [ -f "$PROJECT_DIR/ysp-live-v9.8-TMXK.py" ] && [ -f "$PROJECT_DIR/ysp-engine.js" ] || {
+        say_error "核心程序文件不完整，已中止启动。"
+        return 1
+    }
+}
+wait_for_health() {
+    attempt=1
+    while [ "$attempt" -le 30 ]; do
+        wget -q -O /dev/null "http://127.0.0.1:$PORT/health" 2>/dev/null && return 0
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+restore_previous_container() {
+    [ -n "$OLD_CONTAINER_BACKUP" ] || return 0
+    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || :
+    if docker inspect "$OLD_CONTAINER_BACKUP" >/dev/null 2>&1; then
+        docker rename "$OLD_CONTAINER_BACKUP" "$CONTAINER_NAME" &&
+            docker start "$CONTAINER_NAME" >/dev/null 2>&1
+    fi
+}
+
 do_install() {
     echo "===================================================================="
-    echo "  🚀 开始部署 ysp-live..."
+    echo "  ysp-live 9.8-TMXK 安装 / 更新"
     echo "===================================================================="
+    check_environment || return 1
+    mkdir -p "$INSTALL_BASE" "$PROJECT_DIR" || return 1
 
-    # 检查 Docker 环境
-    if ! command -v docker >/dev/null 2>&1; then
-        printf "\033[1;31m[错误] 未检测到 Docker，请先在 OpenWrt/Linux 中安装 Docker。\033[0m\n"
-        exit 1
-    fi
-
-    mkdir -p ${INSTALL_DIR} && cd ${INSTALL_DIR}
-
-    echo "[1/3] 正在从 GitHub 下载最新源码..."
-    wget --no-check-certificate https://codeload.github.com/tmxk2020/ysp-live/zip/refs/heads/main -O ysp-live.zip
-    if [ $? -ne 0 ]; then
-        printf "\033[1;31m[错误] 源码下载失败，请检查网络连接。\033[0m\n"
-        exit 1
-    fi
-
-    unzip -q -o ysp-live.zip
-    cd ysp-live-main || exit 1
-
-    echo "[2/3] 清理旧容器并构建启动..."
-    docker rm -f ${CONTAINER_NAME} 2>/dev/null
-    docker compose up -d --build
-
-    if [ $? -eq 0 ]; then
-        printf "\033[1;32m[3/3] ysp-live 部署成功！\033[0m\n"
-        show_links
+    CONTAINER_ID=$(docker ps -aq -f "name=^/$CONTAINER_NAME$" | head -n 1)
+    OLD_CONTAINER_BACKUP=""
+    if [ -n "$CONTAINER_ID" ]; then
+        echo "[1/5] 检查并备份现有数据..."
+        backup_existing_data || return 1
     else
-        printf "\033[1;31m[错误] 容器启动失败，请检查 Docker 日志。\033[0m\n"
+        echo "[1/5] 首次安装，准备数据目录..."
+        mkdir -p "$PROJECT_DIR/data" || return 1
     fi
+
+    download_and_stage || return 1
+    echo "[3/5] 检查 Docker Compose 配置..."
+    (cd "$PROJECT_DIR" && compose config >/dev/null) || {
+        say_error "Compose 配置检查失败，旧容器尚未停止。"
+        return 1
+    }
+
+    if [ -n "$CONTAINER_ID" ]; then
+        OLD_CONTAINER_BACKUP="ysp-live-rollback-$(date +%Y%m%d-%H%M%S)"
+        echo "[4/5] 暂停旧容器并保留回滚副本..."
+        docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || {
+            say_error "无法停止旧容器，已中止更新。"
+            return 1
+        }
+        docker rename "$CONTAINER_NAME" "$OLD_CONTAINER_BACKUP" || {
+            docker start "$CONTAINER_NAME" >/dev/null 2>&1 || :
+            say_error "无法保留旧容器回滚副本，已中止更新。"
+            return 1
+        }
+    else
+        echo "[4/5] 构建并启动容器..."
+    fi
+
+    if ! (cd "$PROJECT_DIR" && compose up -d --build); then
+        say_error "新容器构建或启动失败，正在尝试恢复旧容器..."
+        restore_previous_container
+        echo "数据备份保留在：$INSTALL_BASE/backups/"
+        return 1
+    fi
+
+    echo "[5/5] 等待健康检查..."
+    if wait_for_health; then
+        say_ok "ysp-live 已启动，健康接口响应正常。"
+        if [ -n "$OLD_CONTAINER_BACKUP" ]; then
+            docker rm -f "$OLD_CONTAINER_BACKUP" >/dev/null 2>&1 || :
+        fi
+        show_links
+        return 0
+    fi
+
+    say_error "新容器的 /health 在 60 秒内未响应，正在尝试恢复旧容器..."
+    docker logs --tail 80 "$CONTAINER_NAME" 2>&1
+    restore_previous_container
+    echo "数据备份保留在：$INSTALL_BASE/backups/"
+    return 1
 }
-
-# ==========================================
-# 主逻辑：检查容器状态并分发交互菜单
-# ==========================================
-if [ "$(docker ps -a -q -f name=${CONTAINER_NAME})" ]; then
+show_menu() {
     echo "===================================================================="
-    echo "  检测到系统中已存在 ${CONTAINER_NAME} 容器实例"
+    echo "  检测到 ysp-live 容器"
+    echo "  1) 显示访问链接"
+    echo "  2) 查看实时日志"
+    echo "  3) 检查健康接口"
+    echo "  4) 备份数据并更新"
+    echo "  5) 退出"
     echo "===================================================================="
-    echo " 请选择要执行的操作："
-    echo "   1) 📄 显示当前服务的访问与订阅链接"
-    echo "   2) 📊 查看实时运行日志 (Docker Logs)"
-    echo "   3) 🩺 本地检查系统健康度 (Health API)"
-    echo "   4) 🔄 重新安装 / 更新到最新版本 (Reinstall)"
-    echo "   5) ❌ 退出脚本"
-    echo "===================================================================="
-    printf "请输入选项编号 [1-5]: "
+    printf "请选择 [1-5]: "
     read choice
-
     case "$choice" in
-        1)
-            show_links
-            ;;
-        2)
-            echo "正在进入实时日志流 (按 Ctrl+C 可退出日志查看)..."
-            docker logs -f ${CONTAINER_NAME}
-            ;;
+        1) show_links ;;
+        2) docker logs -f "$CONTAINER_NAME" ;;
         3)
-            echo "正在请求本地健康接口..."
             if command -v curl >/dev/null 2>&1; then
-                curl -s http://127.0.0.1:${PORT}/health
-                echo ""
+                curl -fsS "http://127.0.0.1:$PORT/health" || say_error "健康接口暂不可用。"
             else
-                wget -qO- http://127.0.0.1:${PORT}/health
+                wget -qO- "http://127.0.0.1:$PORT/health" || say_error "健康接口暂不可用。"
                 echo ""
             fi
             ;;
-        4)
-            echo "即将开始重新安装与更新..."
-            do_install
-            ;;
-        *)
-            echo "已安全退出。"
-            exit 0
-            ;;
+        4) do_install ;;
+        *) echo "已退出。" ;;
     esac
+}
+
+if ! check_environment; then exit 1; fi
+if [ -n "$(docker ps -aq -f "name=^/$CONTAINER_NAME$" | head -n 1)" ]; then
+    show_menu
 else
-    echo "===================================================================="
-    echo "  未检测到 ${CONTAINER_NAME} 运行实例"
-    echo "===================================================================="
-    printf "是否立即开始自动安装？[y/N]: "
+    echo "未检测到 ysp-live 容器，将执行首次安装。"
+    printf "是否继续？[y/N]: "
     read confirm
-    case "$confirm" in
-        [yY] | [yY][eE][sS])
-            do_install
-            ;;
-        *)
-            echo "已取消安装。"
-            exit 0
-            ;;
-    esac
+    case "$confirm" in [yY]|[yY][eE][sS]) do_install ;; *) echo "已取消安装。" ;; esac
 fi

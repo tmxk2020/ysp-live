@@ -1,4 +1,3 @@
-
 services:
   ysp-live:
     image: ysp-live:9.8-TMXK
@@ -13,12 +12,19 @@ services:
       - 119.29.29.29
       - 1.1.1.1
     volumes:
-      - ./data:/app/data
+      # Installer keeps the previous host data path in .env during upgrades.
+      - "${YSP_HOST_DATA_DIR:-./data}:/app/data"
     environment:
       - TZ=Asia/Shanghai
       - PYTHONUNBUFFERED=1
       - YSP_DATA_DIR=/app/data
       - NODE_OPTIONS=--max-old-space-size=256 --optimize-for-size
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8767/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     logging:
       driver: "json-file"
       options:

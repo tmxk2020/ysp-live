@@ -1,105 +1,125 @@
-# 🚀 ysp-live-docker (软路由优化版)
+# 🚀 ysp-live-docker 9.8-TMXK（软路由优化版）
 
-一个基于 Docker 与 Python 构建的轻量级流媒体代理与直播源处理工具。针对软路由（OpenWrt）环境深度优化，完美解决复杂的 NAT/网桥痛点，实现开箱即用与一键智能化部署。
+一个基于 Docker 与 Python 构建的直播源处理与转发工具，针对 OpenWrt 软路由及 Linux Docker 环境提供 Host 网络部署方式。
 
----
-
-## ✨ 核心亮点
-
-- **🌐 极致网络兼容（Host 模式）**：放弃传统的 Bridge 桥接网络，直接复用宿主机网络栈，彻底告别“无视频、连接超时、组播不通”等玄学问题。
-- **🛡️ 稳定 DNS 容灾**：内置多线公共 DNS 强制指定，彻底解决软路由环境下常见的域名解析抖动与 `[Errno -3]` 报错。
-- **⚡ V8 内存深度调优**：针对 Node.js 运行时进行垃圾回收（GC）与老生代内存限制，长期运行不溢出、切台丝滑。
-- **🤖 智能一键部署**：内置智能检测脚本，自动识别运行状态，避免重复部署，让小白也能秒级上手。
-- **📦 极简轻量化**：基于 Alpine Linux 基础镜像构建，资源占用极低，稳定运行不卡顿。
-- **💾 数据持久化**：支持挂载本地存储，配置与核心数据实时保存，容器更新升级不丢数据。
+本分支只完善安装、升级、数据持久化和健康检查流程，**不改动 9.8 的播放解析核心逻辑**。
 
 ---
 
-## ⚡ 一键智能部署（推荐）
+## ✨ 核心特点
 
-在你的 OpenWrt 软路由或其他 Linux 终端中，直接复制并运行以下一行命令即可完成自动化检测、下载与部署：
+- **🌐 Host 网络模式**：容器直接使用宿主机网络，适合需要访问局域网组播或特殊网络环境的设备。
+- **🛡️ DNS 配置**：提供常用公共 DNS 配置，可按自己的网络环境调整。
+- **⚡ Node.js 运行参数**：保留原有 V8 内存参数。
+- **📦 轻量镜像**：基于 Alpine Python 镜像构建，并安装 Node.js 运行时。
+- **💾 数据持久化**：配置和运行数据挂载到宿主机；更新前自动备份旧数据。
+- **🩺 健康检查**：Compose 和安装脚本都会检查本地 `/health` 接口。
 
-```bash
+---
+
+## ⚡ 一键安装 / 更新（推荐）
+
+适用于已安装 Docker 和 Docker Compose 的 OpenWrt 或 Linux 设备：
+
+```sh
 sh -c "$(wget -O- https://raw.githubusercontent.com/tmxk2020/ysp-live/main/install.sh)"
 ```
 
-> *注：脚本会自动检测容器运行状态。若已运行会友好提示；若未部署或需更新，会自动拉取最新源码并完成清理重建。*
+首次安装时按提示确认即可。检测到已有容器时，会显示管理菜单，可查看链接、日志、健康状态或执行更新。
+
+### 更新时会做什么
+
+1. 检查 Docker、Docker Compose、wget、unzip 和 Docker 服务状态。
+2. 识别旧容器的 `/app/data` 实际挂载路径。
+3. 更新前将旧数据备份到 `/root/ysp-live/backups/`。
+4. 保留原有数据挂载路径；如果旧容器使用 Docker 命名卷，则将数据复制到项目持久化目录，原卷不会被删除。
+5. 下载并检查源码文件，先执行 `docker compose config` 校验。
+6. 构建并启动 9.8-TMXK，再等待 `/health` 响应。
+
+如果配置检查或数据备份失败，脚本会中止更新，不会先删除旧容器。更新后若健康检查未通过，可查看脚本输出的 Docker 日志及备份目录。
+
+> 默认项目目录：`/root/ysp-live/ysp-live-main`  
+> 默认数据目录：`/root/ysp-live/ysp-live-main/data`  
+> 备份目录：`/root/ysp-live/backups/`
 
 ---
 
-## 🛠 手动部署指南（Docker Compose）
+## 🛠 手动部署（Docker Compose）
 
-如果你喜欢手动管理，也可以使用 `docker-compose` 进行部署：
+下载仓库源码后，在项目目录执行：
 
-1. **编写 `docker-compose.yml`**：
-
-```yaml
-services:
-  ysp-live:
-    image: ysp-live:9.5.1
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: ysp-live
-    restart: unless-stopped
-    network_mode: host
-    dns:
-      - 223.5.5.5     # 阿里 DNS（国内解析极快）
-      - 119.29.29.29  # 腾讯 DNS
-      - 1.1.1.1       # 国际备用
-    volumes:
-      - ./data:/app/data
-    environment:
-      - TZ=Asia/Shanghai
-      - PYTHONUNBUFFERED=1
-      - YSP_DATA_DIR=/app/data
-      - NODE_OPTIONS="--max-old-space-size=256 --optimize-for-size"  # 优化 V8 内存与垃圾回收
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+```sh
+docker compose config
+docker compose up -d --build
 ```
 
-2. **构建并后台启动**：
+当前 Compose 配置使用：
 
-```bash
+- 镜像标签：`ysp-live:9.8-TMXK`
+- 网络模式：`host`
+- 服务端口：`8767`
+- 默认数据目录：当前项目目录下的 `data`
+- 健康接口：`http://127.0.0.1:8767/health`
+
+如需把数据放在其他宿主机目录，可在项目目录的 `.env` 中设置：
+
+```dotenv
+YSP_HOST_DATA_DIR="/你的持久化数据目录"
+```
+
+然后重新执行：
+
+```sh
 docker compose up -d --build
 ```
 
 ---
 
-## ❓ 常见问题与解决办法
+## 🔗 服务地址
 
-### 1. 启动时提示容器名冲突 (`Conflict. The container name is already in use`)
-- **原因**：本地已经存在同名的旧容器未清理。
-- **解决办法**：
-  ```bash
-  docker rm -f ysp-live
-  docker compose up -d
-  ```
+部署成功后，将设备 IP 替换为你的软路由或服务器局域网 IP：
 
-### 2. 访问端口冲突或无法访问
-- **原因**：默认端口 `8767` 可能已被软路由上的其他服务占用。
-- **解决办法**：因为采用了 `network_mode: host`，服务直接绑定在宿主机端口。如需修改，请调整代码中的服务监听逻辑或避开该端口。
+| 用途 | 地址 |
+|---|---|
+| 全频道订阅 | `http://设备IP:8767/all.m3u` |
+| 健康检查 | `http://设备IP:8767/health` |
+| 运行诊断 | `http://设备IP:8767/diag` |
 
 ---
 
-## 🔗 相关链接与社区
+## ❓ 常见问题
+
+### 1. 提示 Docker Compose 不存在
+
+确认已安装 Docker Compose 插件（`docker compose`）或独立命令（`docker-compose`）。
+
+### 2. 服务启动后无法访问
+
+确认 8767 端口没有被其他程序占用，并检查：
+
+```sh
+docker ps -a
+docker logs --tail 100 ysp-live
+```
+
+### 3. 更新后需要恢复旧数据
+
+更新前的备份位于 `/root/ysp-live/backups/`。请先停止容器，再按需恢复对应备份目录中的数据；不要删除原备份。
+
+---
+
+## 🔗 官方网站与交流
 
 - **官方网站**：[tmxk.pp.ua](https://tmxk.pp.ua)
 - **联系我们 / 交流反馈**：[tmxk.pp.ua/d/10-lian-xi-wo-men](https://tmxk.pp.ua/d/10-lian-xi-wo-men)
+- **TMXK 频道**：[TMXKの分享](https://t.me/tmxktg)
+- **TG 推广 / 频道入口**：[@stymei](https://t.me/stymei)
 
 ---
 
-## 📢 首发地址
+## 📢 首发与原作者来源
 
-- **频道**：[TMXKの分享](https://t.me/tmxktg)
+- **项目首发**：TMXK
+- **原代码及作者频道**：[Gary's Club Channel](https://t.me/garysclubchannel)
 
----
-
-## 🎉 原代码地址
-
-- **频道**：[Gary's Club Channel](https://t.me/garysclubchannel)
-
-
+感谢原作者的代码与分享。本项目在原有基础上进行适配和维护，保留来源致谢。
